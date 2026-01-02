@@ -9,32 +9,177 @@
       document.body.appendChild(s);
     });
   }
+  function toLines(text) {
+    return text.split(/\r?\n/);
+  }
+  function parseInlineVaultDescriptors(lines) {
+    const descriptors = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line || line.trim().startsWith('#')) continue;
+      const vaultIndex = line.indexOf('!vault');
+      if (vaultIndex === -1) continue;
+      const afterVault = line.slice(vaultIndex);
+      if (!afterVault.match(/!vault\b/)) continue;
+      let dataStart = i + 1;
+      while (dataStart < lines.length && lines[dataStart].trim() === '') {
+        dataStart++;
+      }
+      if (dataStart >= lines.length) break;
+      const candidate = lines[dataStart];
+      const trimmed = candidate.trim();
+      if (!trimmed.startsWith('$ANSIBLE_VAULT;')) continue;
+      const indentMatch = candidate.match(/^(\s*)/);
+      const indent = indentMatch ? indentMatch[1] : '';
+      if (!indent) continue;
+      let dataEnd = dataStart;
+      for (let j = dataStart; j < lines.length; j++) {
+        const blockLine = lines[j];
+        if (blockLine.trim() === '') {
+          dataEnd = j;
+          continue;
+        }
+        if (!blockLine.startsWith(indent)) {
+          break;
+        }
+        dataEnd = j;
+      }
+      descriptors.push({
+        headerLine: i,
+        dataStart,
+        dataEnd,
+        indent
+      });
+      i = dataEnd;
+    }
+    return descriptors;
+  }
+  function buildPlaintextView(lines, metas) {
+    const result = [];
+    let pointer = 0;
+    for (const meta of metas) {
+      const descr = meta.descriptor;
+      while (pointer < descr.headerLine) {
+        result.push(lines[pointer++]);
+      }
+      result.push(lines[pointer++]);
+      const plaintextLines = meta.plaintext.split(/\r?\n/);
+      for (const line of plaintextLines) {
+        if (line === '') {
+          result.push('');
+        } else {
+          result.push(descr.indent + line);
+        }
+      }
+      pointer = descr.dataEnd + 1;
+    }
+    while (pointer < lines.length) {
+      result.push(lines[pointer++]);
+    }
+    return result.join('\n');
+  }
+  function rebuildInlineTextarea(editorText, metas) {
+    const lines = toLines(editorText);
+    const descriptors = parseInlineVaultDescriptors(lines);
+    if (descriptors.length !== metas.length) return null;
+    const result = [];
+    let pointer = 0;
+    for (let i = 0; i < descriptors.length; i++) {
+      const descr = descriptors[i];
+      const meta = metas[i];
+      while (pointer < descr.headerLine) {
+        result.push(lines[pointer++]);
+      }
+      result.push(lines[pointer++]);
+      const plaintextLines = [];
+      for (let j = descr.dataStart; j <= descr.dataEnd; j++) {
+        const line = lines[j];
+        if (line.startsWith(descr.indent)) {
+          plaintextLines.push(line.slice(descr.indent.length));
+        } else {
+          plaintextLines.push(line);
+        }
+      }
+      const plaintext = plaintextLines.join('\n');
+      const encrypted = meta.vaultInstance.encrypt(plaintext);
+      const encryptedLines = encrypted.split('\n');
+      for (const encryptedLine of encryptedLines) {
+        result.push(encryptedLine ? descr.indent + encryptedLine : descr.indent);
+      }
+      pointer = descr.dataEnd + 1;
+    }
+    while (pointer < lines.length) {
+      result.push(lines[pointer++]);
+    }
+    return result.join('\n');
+  }
   let textarea = $('.repository.editor textarea#edit_area')[0];
-  if (textarea && textarea.value.match(/^\$ANSIBLE_VAULT;.+AES256/)) {
-    Promise.all([
-      lS("/assets/ansibleVault/sjcl.min.js"),
-      lS("/assets/ansibleVault/ansibleVault.js")
-    ]).then(function () {
-      textarea.ansibleVault = new ansibleVault(textarea.value);
-      if (textarea.ansibleVault.isValid()){
-        $('#tree_path').parent().append('<input type="password" id="vault-password" autocomplete="vault-password" placeholder="decryption password" visibility_annotation="true" pm_parser_annotation="password_element">');
-        $('#vault-password').change(function(){
-          text = textarea.ansibleVault.decrypt($('#vault-password').val());
-          if (text){
+  if (textarea) {
+    const value = textarea.value;
+    const lines = toLines(value);
+    const inlineDescriptors = parseInlineVaultDescriptors(lines);
+    if (value.match(/^\$ANSIBLE_VAULT;.+AES256/) || inlineDescriptors.length) {
+      Promise.all([
+        lS("/assets/ansibleVault/sjcl.min.js"),
+        lS("/assets/ansibleVault/ansibleVault.js")
+      ]).then(function () {
+        const isFullVault = !!value.match(/^\$ANSIBLE_VAULT;.+AES256/);
+        if (isFullVault) {
+          textarea.ansibleVault = new ansibleVault(value);
+          if (textarea.ansibleVault.isValid()){
+            $('#tree_path').parent().append('<input type="password" id="vault-password" autocomplete="vault-password" placeholder="decryption password" visibility_annotation="true" pm_parser_annotation="password_element">');
+            $('#vault-password').change(function(){
+              const text = textarea.ansibleVault.decrypt($('#vault-password').val());
+              if (text){
+                for (let editor of window.codeEditors) {
+                  if (editor.getValue() === textarea.value){
+                    const model = editor.getModel();
+                    model.onDidChangeContent(() => {
+                      textarea.value = textarea.ansibleVault.encrypt(editor.getValue());
+                      textarea.dispatchEvent(new Event('change'));
+                    });
+                    editor.setValue(text);
+                    $('#vault-password').remove();
+                  }
+                }
+              }
+            });
+          }
+        } else if (inlineDescriptors.length) {
+          $('#tree_path').parent().append('<input type="password" id="vault-password" autocomplete="vault-password" placeholder="decryption password" visibility_annotation="true" pm_parser_annotation="password_element">');
+          $('#vault-password').change(function(){
+            const password = $('#vault-password').val();
+            const metas = [];
+            let success = true;
+            for (const descriptor of inlineDescriptors) {
+              const block = lines.slice(descriptor.dataStart, descriptor.dataEnd + 1).map(line => line.trim()).join('\n');
+              const vault = new ansibleVault(block);
+              const plaintext = vault.decrypt(password);
+              if (!plaintext) {
+                success = false;
+                break;
+              }
+              metas.push({descriptor, vaultInstance: vault, plaintext});
+            }
+            if (!success) return;
+            textarea.inlineBlockMetas = metas;
             for (let editor of window.codeEditors) {
               if (editor.getValue() === textarea.value){
                 const model = editor.getModel();
                 model.onDidChangeContent(() => {
-                  textarea.value = textarea.ansibleVault.encrypt(editor.getValue());
-                  textarea.dispatchEvent(new Event('change'));
+                  const encrypted = rebuildInlineTextarea(editor.getValue(), textarea.inlineBlockMetas);
+                  if (encrypted !== null) {
+                    textarea.value = encrypted;
+                    textarea.dispatchEvent(new Event('change'));
+                  }
                 });
-                editor.setValue(text);
+                editor.setValue(buildPlaintextView(lines, metas));
                 $('#vault-password').remove();
               }
             }
-          }
-        });
-      }
-    });
+          });
+        }
+      });
+    }
   }
 </script>
