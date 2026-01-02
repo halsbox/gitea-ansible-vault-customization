@@ -1,0 +1,40 @@
+<script>
+  function lS(src) {
+    return new Promise(function (resolve, reject) {
+      let s = document.createElement("script");
+      s.src = src;
+      s.addEventListener("load", () => {
+        resolve();
+      });
+      document.body.appendChild(s);
+    });
+  }
+  let textarea = $('.repository.editor textarea#edit_area')[0];
+  if (textarea && textarea.value.match(/^\$ANSIBLE_VAULT;.+AES256/)) {
+    Promise.all([
+      lS("/assets/ansibleVault/sjcl.min.js"),
+      lS("/assets/ansibleVault/ansibleVault.js")
+    ]).then(function () {
+      textarea.ansibleVault = new ansibleVault(textarea.value);
+      if (textarea.ansibleVault.isValid()){
+        $('#tree_path').parent().append('<input type="password" id="vault-password" autocomplete="vault-password" placeholder="decryption password" visibility_annotation="true" pm_parser_annotation="password_element">');
+        $('#vault-password').change(function(){
+          text = textarea.ansibleVault.decrypt($('#vault-password').val());
+          if (text){
+            for (let editor of window.codeEditors) {
+              if (editor.getValue() === textarea.value){
+                const model = editor.getModel();
+                model.onDidChangeContent(() => {
+                  textarea.value = textarea.ansibleVault.encrypt(editor.getValue());
+                  textarea.dispatchEvent(new Event('change'));
+                });
+                editor.setValue(text);
+                $('#vault-password').remove();
+              }
+            }
+          }
+        });
+      }
+    });
+  }
+</script>
